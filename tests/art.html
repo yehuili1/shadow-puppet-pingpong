@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>皮影美术测试</title>
+<style>
+  html, body { margin: 0; background: #1c1c1c; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script type="module">
+// 皮影美术测试页：?view=stage|color|grid|zoom|override
+//   stage   戏台（羊皮纸暖光）上的 shadow 风格完整皮影（简易正向运动学拼装）
+//   color   深灰底上的彩绘皮影（大 + 小两种尺寸）
+//   grid    2 角色 × 2 风格 × 全部部件，画枢轴十字与名义长度线
+//   zoom    单个皮影放大看拼接（&ch=hero|rival&st=shadow|color&s=1.6）
+//   joints  关节压力测试：各种肘角/髋角，看拼接处有无缝隙
+//   override PNG 覆盖：测试 manifest（一个有效 PNG + 一个缺失文件）
+import { loadPuppetArt, getPart, renderPart } from '../src/puppet/art.js';
+import { SK, PARTS, CHARACTERS, STYLES } from '../src/puppet/skeleton.js';
+import { WORLD, TABLE, PADDLE_R, PELVIS_Y, STRING_TOP_Y } from '../src/core/world.js';
+
+const q = new URLSearchParams(location.search);
+const view = q.get('view') || 'stage';
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const W = innerWidth, H = innerHeight;
+cv.width = W; cv.height = H;
+cv.style.width = W + 'px'; cv.style.height = H + 'px';
+
+const T = { view, ok: true, errors: [], checks: {} };
+window.__test = T;
+const fail = (msg) => { T.ok = false; T.errors.push(msg); };
+
+// ---------- 简易正向运动学（测试自用，不依赖 rig.js） ----------
+const rot = (x, y, a) => ({ x: x * Math.cos(a) - y * Math.sin(a), y: x * Math.sin(a) + y * Math.cos(a) });
+const add = (a, b) => ({ x: a.x + b.x, y: a.y + b.y });
+
+function part(c, ch, st, name, p, ang, sx = 1, dim = 0) {
+  const a = getPart(ch, st, name);
+  c.save();
+  c.translate(p.x, p.y); c.rotate(ang); if (sx !== 1) c.scale(sx, 1);
+  c.scale(a.s, a.s);
+  if (dim) c.filter = `brightness(${1 - dim})`;
+  c.drawImage(a.img, -a.ox, -a.oy);
+  c.restore();
+}
+
+// 返回世界坐标的提线挂点
+function puppet(c, ch, st, P, { x, y, facing = 1, scale = 1 }) {
+  c.save();
+  c.translate(x, y); c.scale(facing * scale, scale);
+  const L = P.lean || 0;
+  const arm = (sh, aS, aE) => {
+    const s = rot(sh.x, sh.y, L), a1 = L + aS, e = add(s, rot(0, SK.upperArmLen, a1)), a2 = a1 + aE;
+    return { s, e, w: add(e, rot(0, SK.forearmLen, a2)), a1, a2 };
+  };
+  const back = arm(SK.backShoulder, P.backShoulder, P.backElbow);
+  const front = arm(SK.frontShoulder, P.frontShoulder, P.frontElbow);
+  const dimBack = st === 'color' ? 0.18 : 0;
+  part(c, ch, st, 'upperArm', back.s, back.a1, 1, dimBack);
+  part(c, ch, st, 'forearm', back.e, back.a2, 1, dimBack);
+  part(c, ch, st, 'sword', back.w, back.a2 + (P.swordAngle || 0));
+  part(c, ch, st, 'leg', SK.backHip, P.backLeg, 1, dimBack);
+  part(c, ch, st, 'leg', SK.frontHip, P.frontLeg);
+  part(c, ch, st, 'skirt', { x: 0, y: 0 }, L * 0.3);
+  part(c, ch, st, 'torso', { x: 0, y: 0 }, L);
+  const neck = rot(SK.neck.x, SK.neck.y, L), ha = L + (P.headTilt || 0);
+  part(c, ch, st, 'head', neck, ha);
+  if (P.tongue > 0) part(c, ch, st, 'tongue', add(neck, rot(SK.mouth.x, SK.mouth.y, ha)), ha + (P.tongueAngle || 0), P.tongue);
+  part(c, ch, st, 'upperArm', front.s, front.a1);
+  part(c, ch, st, 'forearm', front.e, front.a2);
+  part(c, ch, st, 'paddle', front.w, front.a2 + (P.paddleAngle || 0));
+  c.restore();
+  const wp = (p) => ({ x: x + p.x * facing * scale, y: y + p.y * scale });
+  return { head: wp(add(neck, rot(SK.headTop.x, SK.headTop.y, ha))), front: wp(front.w), back: wp(back.w), pelvis: { x, y } };
+}
+
+// 参考视频那样的乒乓姿势：持拍手前伸、剑手后举
+const POSE_HERO = { lean: 0.05, headTilt: -0.04, frontShoulder: -1.3, frontElbow: -0.3, backShoulder: 1.05, backElbow: 1.05, swordAngle: 0.15, frontLeg: -0.2, backLeg: 0.22, tongue: 0 };
+// 电脑：接球姿势，剑横在腰间，吐舌头嘲讽
+const POSE_RIVAL = { lean: -0.03, headTilt: 0.06, frontShoulder: -1.15, frontElbow: -0.45, backShoulder: 0.35, backElbow: -1.35, swordAngle: -0.55, frontLeg: -0.16, backLeg: 0.2, tongue: 1, tongueAngle: 0.15 };
+
+function strings(c, pts, color = 'rgba(70,48,30,0.55)') {
+  c.save(); c.strokeStyle = color; c.lineWidth = 1.2;
+  for (const p of pts) { c.beginPath(); c.moveTo(p.x, STRING_TOP_Y); c.lineTo(p.x, p.y); c.stroke(); }
+  c.restore();
+}
+
+function parchment(c, w, h) {
+  const g = c.createRadialGradient(w * 0.5, h * 0.45, 20, w * 0.5, h * 0.5, Math.max(w, h) * 0.7);
+  g.addColorStop(0, '#fbecc4'); g.addColorStop(0.35, '#e9c98e'); g.addColorStop(0.75, '#b98a4f'); g.addColorStop(1, '#6e4a26');
+  c.fillStyle = g; c.fillRect(0, 0, w, h);
+  // 纸纹
+  let s = 7;
+  const r = () => ((s = (s * 16807) % 2147483647) / 2147483647);
+  c.save();
+  for (let i = 0; i < 900; i++) { c.fillStyle = `rgba(90,60,30,${r() * 0.06})`; const rr = 2 + r() * 18; c.beginPath(); c.arc(r() * w, r() * h, rr, 0, 7); c.fill(); }
+  c.restore();
+}
+
+function fitWorld(c) {
+  const s = Math.min(W / WORLD.W, H / WORLD.H);
+  c.translate((W - WORLD.W * s) / 2, (H - WORLD.H * s) / 2); c.scale(s, s);
+  return s;
+}
+
+function table(c) {
+  c.save(); c.fillStyle = 'rgba(70,42,20,0.85)';
+  c.fillRect(TABLE.x0, TABLE.topY, TABLE.x1 - TABLE.x0, TABLE.thickness);
+  c.fillRect(TABLE.x0 + 30, TABLE.topY, 14, WORLD.floorY - TABLE.topY);
+  c.fillRect(TABLE.x1 - 44, TABLE.topY, 14, WORLD.floorY - TABLE.topY);
+  c.fillRect(TABLE.netX - 2, TABLE.netTopY, 4, TABLE.topY - TABLE.netTopY);
+  c.restore();
+}
+
+// ---------- 视图 ----------
+function drawStage() {
+  parchment(ctx, W, H);
+  ctx.save();
+  fitWorld(ctx);
+  table(ctx);
+  const a = puppet(ctx, 'hero', 'shadow', POSE_HERO, { x: 330, y: PELVIS_Y, facing: 1 });
+  const b = puppet(ctx, 'rival', 'shadow', POSE_RIVAL, { x: 1270, y: PELVIS_Y, facing: -1 });
+  strings(ctx, [a.head, a.front, a.back, b.head, b.front, b.back]);
+  ctx.restore();
+}
+
+function drawColor() {
+  ctx.fillStyle = '#3a3a3a'; ctx.fillRect(0, 0, W, H);
+  const s = Math.min(W / 1500, H / 1000);
+  ctx.save(); ctx.scale(s, s);
+  const a = puppet(ctx, 'hero', 'color', POSE_HERO, { x: 330, y: 580, facing: 1, scale: 0.85 });
+  const b = puppet(ctx, 'rival', 'color', POSE_RIVAL, { x: 980, y: 580, facing: -1, scale: 0.85 });
+  strings(ctx, [a.head, a.front, a.back, b.head, b.front, b.back], 'rgba(255,77,109,0.8)');
+  // HUD 上的小尺寸
+  puppet(ctx, 'hero', 'color', POSE_HERO, { x: 1290, y: 420, facing: 1, scale: 0.3 });
+  puppet(ctx, 'rival', 'color', POSE_RIVAL, { x: 1300, y: 760, facing: -1, scale: 0.3 });
+  ctx.restore();
+}
+
+function drawZoom() {
+  const ch = q.get('ch') || 'hero', st = q.get('st') || 'shadow', s = +(q.get('s') || 1.6);
+  if (st === 'shadow') parchment(ctx, W, H); else { ctx.fillStyle = '#3a3a3a'; ctx.fillRect(0, 0, W, H); }
+  const pose = ch === 'hero' ? POSE_HERO : POSE_RIVAL;
+  const facing = +(q.get('f') || 1);
+  puppet(ctx, ch, st, pose, { x: W / 2 + (q.has('dx') ? +q.get('dx') : 0), y: +(q.get('y') || 560), facing, scale: s });
+}
+
+// 关节压力测试：不同肘角的手臂链、不同髋角的腿 + 袍摆
+function drawJoints() {
+  const st = q.get('st') || 'shadow', ch = q.get('ch') || 'hero', s = +(q.get('s') || 1.5);
+  if (st === 'shadow') parchment(ctx, W, H); else { ctx.fillStyle = '#3a3a3a'; ctx.fillRect(0, 0, W, H); }
+  const elbows = [-2.6, -1.8, -1, -0.3, 0.3, 1, 1.8, 2.6];
+  elbows.forEach((eb, i) => {
+    const x = 70 + i * 120, y = 60;
+    ctx.save(); ctx.translate(x, y); ctx.scale(s * 0.55, s * 0.55);
+    const e = rot(0, SK.upperArmLen, 0.25), a2 = 0.25 + eb;
+    part(ctx, ch, st, 'upperArm', { x: 0, y: 0 }, 0.25);
+    part(ctx, ch, st, 'forearm', e, a2);
+    part(ctx, ch, st, 'paddle', add(e, rot(0, SK.forearmLen, a2)), a2);
+    ctx.restore();
+  });
+  // 吐舌头：rig 只沿 x 缩放（0.25 / 0.5 / 0.75 / 1）
+  [0.25, 0.5, 0.75, 1].forEach((tg, i) => {
+    ctx.save(); ctx.translate(170 + i * 220, H - 30); ctx.scale(s * 0.55, s * 0.55);
+    part(ctx, 'rival', st, 'head', { x: 0, y: 0 }, 0);
+    part(ctx, 'rival', st, 'tongue', SK.mouth, 0, tg);
+    ctx.restore();
+  });
+  // 腿 + 袍摆 + 躯干：髋角张开/并拢
+  [[-0.6, 0.5], [-0.25, 0.25], [0, 0], [0.4, -0.3]].forEach(([fl, bl], i) => {
+    ctx.save(); ctx.translate(140 + i * 250, 520); ctx.scale(s * 0.55, s * 0.55);
+    part(ctx, ch, st, 'leg', SK.backHip, bl);
+    part(ctx, ch, st, 'leg', SK.frontHip, fl);
+    part(ctx, ch, st, 'skirt', { x: 0, y: 0 }, 0);
+    part(ctx, ch, st, 'torso', { x: 0, y: 0 }, 0.12 * (i - 1.5));
+    part(ctx, ch, st, 'head', rot(SK.neck.x, SK.neck.y, 0.12 * (i - 1.5)), 0.12 * (i - 1.5) - 0.15);
+    ctx.restore();
+  });
+}
+
+// 名义长度线（局部单位）
+const NOMINAL = {
+  torso: [[0, 0, SK.neck.x, SK.neck.y]], head: [[0, 0, SK.headTop.x, SK.headTop.y]],
+  upperArm: [[0, 0, 0, SK.upperArmLen]], forearm: [[0, 0, 0, SK.forearmLen], [0, SK.forearmLen, 0, SK.forearmLen + SK.handLen]],
+  leg: [[0, 0, 0, SK.legLen], [0, SK.legLen, SK.bootLen, SK.legLen]],
+  skirt: [[0, 0, 0, SK.skirtLen], [-SK.skirtWTop / 2, 0, SK.skirtWTop / 2, 0], [-SK.skirtWBottom / 2, SK.skirtLen, SK.skirtWBottom / 2, SK.skirtLen]],
+  paddle: [[0, 0, 0, SK.paddleHandle]], sword: [[0, 0, 0, SK.swordLen], [-8, SK.swordGuard, 8, SK.swordGuard]],
+  tongue: [[0, 0, SK.tongueLen, 0]],
+};
+const DOTS = { torso: [SK.frontShoulder, SK.backShoulder, SK.neck], head: [SK.mouth, SK.headTop] };
+
+function drawGrid() {
+  ctx.fillStyle = '#1c1c1c'; ctx.fillRect(0, 0, W, H);
+  const rows = [];
+  for (const ch of CHARACTERS) for (const st of STYLES) rows.push([ch, st]);
+  const gap = 18, sc = +(q.get('s') || 0.78);
+  let y = 10;
+  for (const [ch, st] of rows) {
+    const items = PARTS.map((p) => ({ p, a: getPart(ch, st, p) }));
+    const rh = Math.max(...items.map(({ a }) => a.img.height * a.s)) * sc + 26;
+    ctx.fillStyle = st === 'shadow' ? '#e6c793' : '#3a3a3a';
+    ctx.fillRect(0, y, W, rh);
+    ctx.fillStyle = st === 'shadow' ? '#5a3a1a' : '#bbb'; ctx.font = '12px monospace';
+    ctx.fillText(`${ch} / ${st}`, 8, y + 14);
+    let x = 10;
+    for (const { p, a } of items) {
+      const w = a.img.width * a.s * sc, px = x + a.ox * a.s * sc, py = y + 20 + a.oy * a.s * sc;
+      ctx.save(); ctx.translate(px, py); ctx.scale(sc, sc);
+      ctx.save(); ctx.scale(a.s, a.s); ctx.drawImage(a.img, -a.ox, -a.oy);
+      ctx.strokeStyle = 'rgba(0,160,255,0.35)'; ctx.lineWidth = 1; ctx.strokeRect(-a.ox, -a.oy, a.img.width, a.img.height);
+      ctx.restore();
+      ctx.strokeStyle = '#ff2bd6'; ctx.lineWidth = 1.6 / sc;
+      for (const [x0, y0, x1, y1] of NOMINAL[p]) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); }
+      if (p === 'paddle') { ctx.beginPath(); ctx.arc(0, SK.paddleCenter, PADDLE_R, 0, 7); ctx.stroke(); }
+      ctx.fillStyle = '#ff2bd6';
+      for (const d of DOTS[p] || []) { ctx.beginPath(); ctx.arc(d.x, d.y, 2.5 / sc, 0, 7); ctx.fill(); }
+      ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 1.5 / sc;
+      ctx.beginPath(); ctx.moveTo(-8 / sc, 0); ctx.lineTo(8 / sc, 0); ctx.moveTo(0, -8 / sc); ctx.lineTo(0, 8 / sc); ctx.stroke();
+      ctx.restore();
+      ctx.fillStyle = st === 'shadow' ? '#5a3a1a' : '#999'; ctx.fillText(p, x, y + rh - 4);
+      x += w + gap;
+    }
+    y += rh + 6;
+  }
+}
+
+// ---------- 自动检查 ----------
+function alphaAt(a, lx, ly) {
+  const c = document.createElement('canvas'); c.width = a.img.width; c.height = a.img.height;
+  const g = c.getContext('2d'); g.drawImage(a.img, 0, 0);
+  const px = Math.round(a.ox + lx / a.s), py = Math.round(a.oy + ly / a.s);
+  if (px < 0 || py < 0 || px >= c.width || py >= c.height) return -1;
+  return g.getImageData(px, py, 1, 1).data[3];
+}
+function hashOf(img) {
+  const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
+  const g = c.getContext('2d'); g.drawImage(img, 0, 0);
+  const d = g.getImageData(0, 0, c.width, c.height).data;
+  let h = 2166136261; for (let i = 0; i < d.length; i += 7) h = Math.imul(h ^ d[i], 16777619);
+  return h >>> 0;
+}
+// 必须落在皮面上的点（局部单位）：枢轴 + 名义末端
+const SOLID = {
+  torso: [[0, 0], [SK.neck.x, SK.neck.y + 3], [SK.frontShoulder.x, SK.frontShoulder.y], [SK.backShoulder.x, SK.backShoulder.y]],
+  head: [[0, 0], [SK.headTop.x, SK.headTop.y + 6]],
+  skirt: [[0, 0], [-40, -6]], upperArm: [[0, 0], [0, SK.upperArmLen]], forearm: [[0, 0], [0, SK.forearmLen]],
+  leg: [[0, 0], [0, SK.legLen], [SK.bootLen - 6, SK.legLen + 12]], paddle: [[0, 0], [0, SK.paddleCenter]],
+  sword: [[0, 0], [0, SK.swordLen - 8]], tongue: [[0, 0], [SK.tongueLen - 8, 12]],
+};
+function runChecks() {
+  const sizes = {}, missing = [];
+  for (const ch of CHARACTERS) for (const st of STYLES) for (const p of PARTS) {
+    const a = getPart(ch, st, p);
+    if (!(a.img.width > 0 && a.img.height > 0)) fail(`empty ${ch}/${st}/${p}`);
+    if (a.s !== 0.5) fail(`s!=0.5 ${ch}/${st}/${p}`);
+    if (st === 'shadow') sizes[`${ch}/${p}`] = `${a.img.width}x${a.img.height}@${a.ox},${a.oy}`;
+    for (const [lx, ly] of SOLID[p]) {
+      const al = alphaAt(a, lx, ly);
+      if (!(al > 10)) missing.push(`${ch}/${st}/${p}@${lx},${ly}=${al}`);
+    }
+  }
+  if (missing.length) fail('pivot/endpoint not on material: ' + missing.join(' '));
+  // 确定性：重新绘制的像素与缓存一致
+  const det = [];
+  for (const [ch, st, p] of [['hero', 'shadow', 'head'], ['rival', 'color', 'skirt'], ['rival', 'shadow', 'head'], ['hero', 'color', 'leg']]) {
+    const same = hashOf(getPart(ch, st, p).img) === hashOf(renderPart(ch, st, p).img);
+    det.push(same); if (!same) fail(`nondeterministic ${ch}/${st}/${p}`);
+  }
+  T.checks.parts = CHARACTERS.length * STYLES.length * PARTS.length;
+  T.checks.deterministic = det.every(Boolean);
+  T.checks.sizes = sizes;
+}
+
+async function main() {
+  const t0 = performance.now();
+  if (view === 'override') {
+    const r = await loadPuppetArt(new URL('./stubs/art_manifest.json', location.href));
+    T.checks.loaded = r.overrides;
+    const a = getPart('hero', 'shadow', 'paddle'), b = getPart('rival', 'color', 'sword');
+    T.checks.pngApplied = a.img instanceof HTMLImageElement && a.ox === 40 && a.oy === 12 && a.s === 0.5;
+    T.checks.missingFallback = b.img instanceof HTMLCanvasElement;
+    if (!T.checks.pngApplied) fail('png override not applied');
+    if (!T.checks.missingFallback) fail('missing png should fall back');
+    ctx.fillStyle = '#3a3a3a'; ctx.fillRect(0, 0, W, H);
+    ctx.save(); ctx.scale(1.4, 1.4);
+    puppet(ctx, 'hero', 'shadow', POSE_HERO, { x: 200, y: 330, scale: 0.6 });
+    puppet(ctx, 'rival', 'color', POSE_RIVAL, { x: 480, y: 330, facing: -1, scale: 0.6 });
+    ctx.restore();
+  } else {
+    const r = await loadPuppetArt();
+    T.checks.defaultOverrides = r.overrides.length;
+    T.checks.loadMs = Math.round(performance.now() - t0);
+    runChecks();
+    ({ stage: drawStage, color: drawColor, grid: drawGrid, zoom: drawZoom, joints: drawJoints })[view]();
+  }
+  // 绘制耗时（20 次整套 shadow 皮影）
+  const t1 = performance.now();
+  const off = document.createElement('canvas'); off.width = 800; off.height = 600; const oc = off.getContext('2d');
+  for (let i = 0; i < 20; i++) puppet(oc, 'hero', 'shadow', POSE_HERO, { x: 300, y: 300, scale: 0.5 });
+  T.checks.drawMsPerPuppet = +((performance.now() - t1) / 20).toFixed(2);
+  T.done = true;
+}
+main().catch((e) => { fail(String(e && e.stack || e)); T.done = true; throw e; });
+</script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+# 测试输出与依赖
+tools/out/
+tools/node_modules/
+
+# 大文件：假摄像头由 tools/make_fake_cam.py 从原视频生成；原视频不入库
+tools/fake_cam.mjpeg
+tools/fake_cam_last.jpg
+参考素材/原视频.mp4
+
+__pycache__/
+*.log

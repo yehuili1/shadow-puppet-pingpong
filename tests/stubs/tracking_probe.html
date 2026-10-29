@@ -1,0 +1,38 @@
+<!DOCTYPE html><html><body style="margin:0;background:#000">
+<video id="v" playsinline muted style="width:640px;height:480px"></video>
+<script type="module">
+// 探针：比较 delegate / 置信度门限下假摄像头的检测覆盖率（?delegate=CPU&conf=0.3&hz=30）
+import { FilesetResolver, HandLandmarker } from '../../vendor/mediapipe/vision_bundle.mjs';
+const q = new URLSearchParams(location.search);
+const delegate = q.get("delegate") || "GPU", conf = +(q.get("conf") || 0.5), hz = +(q.get("hz") || 30), pres = +(q.get("pres") || conf);
+const v = document.getElementById('v');
+const P = (window.__probe = { delegate, conf, pres, hz, runs: 0, hits: 0, left: 0, perSec: [], err: null, ms: 0, size: null });
+try {
+  v.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+  await v.play();
+  P.size = [v.videoWidth, v.videoHeight];
+  const fs = await FilesetResolver.forVisionTasks('../../vendor/mediapipe/wasm');
+  const lm = await HandLandmarker.createFromOptions(fs, {
+    baseOptions: { modelAssetPath: '../../vendor/models/hand_landmarker.task', delegate },
+    runningMode: 'VIDEO', numHands: 2,
+    minHandDetectionConfidence: conf, minHandPresenceConfidence: pres, minTrackingConfidence: pres,
+  });
+  const t0 = performance.now();
+  let lastRun = 0, lastVt = -1;
+  const loop = (now) => {
+    if (now - lastRun >= 1000 / hz * 0.9 && v.currentTime !== lastVt) {
+      lastRun = now; lastVt = v.currentTime;
+      const a = performance.now();
+      const r = lm.detectForVideo(v, Math.round(now));
+      P.ms = P.ms * 0.9 + (performance.now() - a) * 0.1;
+      const sec = Math.floor((now - t0) / 1000);
+      P.perSec[sec] = P.perSec[sec] || [0, 0];
+      P.perSec[sec][0]++;
+      P.runs++;
+      if (r.landmarks.length) { P.hits++; P.perSec[sec][1]++; if (r.handedness.some((h) => h[0].categoryName === 'Left')) P.left++; }
+    }
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+} catch (e) { P.err = String(e); }
+</script></body></html>

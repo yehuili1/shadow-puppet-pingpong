@@ -1,0 +1,4 @@
+{
+  "hero": { "shadow": { "paddle": { "src": "art_override_paddle.png", "ox": 40, "oy": 12, "s": 0.5 } } },
+  "rival": { "color": { "sword": { "src": "art_override_missing.png", "ox": 20, "oy": 100, "s": 0.5 } } }
+}

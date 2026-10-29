@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>A 手部追踪 · 标定测试</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; background: #0e0e0e; overflow: hidden; }
+  canvas { display: block; }
+  #cam { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="cam" playsinline muted></video>
+<script type="module">
+// 用法：
+//   tests/tracking.html          假摄像头（原视频）：显示镜像画面 + 关键点 + 实时 Control，45s 累计统计到 window.__test
+//   tests/tracking.html?rec=1    额外逐样本记录关键点到 window.__rec（离线标定用）
+//   tests/tracking.html?mock=1   模拟手：用 set() 扫参数，结果在 window.__test.mock
+import { HandTracker, FINGER_CHAINS } from '../src/tracking/hand.js';
+import { MockHand } from '../src/tracking/mock.js';
+import { ControlMapper } from '../src/tracking/control.js';
+
+const params = new URLSearchParams(location.search);
+const MOCK = params.has('mock'), REC = params.has('rec');
+const LOOP = 1343 / 30; // 假摄像头一圈时长（s）
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const video = document.getElementById('cam');
+const tracker = new HandTracker({ video });
+const mapper = new ControlMapper();
+let mock = null, control = null, camT0 = null, err = null;
+
+const W = () => window.innerWidth, H = () => window.innerHeight;
+function resize() {
+  cv.width = W(); cv.height = H();
+}
+addEventListener('resize', resize); resize();
+
+// ---- 统计
+const mkStat = (lo, hi, bins = 10) => ({ lo, hi, min: Infinity, max: -Infinity, n: 0, hist: new Array(bins).fill(0) });
+const addStat = (s, v) => {
+  s.min = Math.min(s.min, v); s.max = Math.max(s.max, v); s.n++;
+  const b = Math.floor(((v - s.lo) / (s.hi - s.lo)) * s.hist.length);
+  s.hist[Math.max(0, Math.min(s.hist.length - 1, b))]++;
+};
+const T = (window.__test = {
+  mode: MOCK ? 'mock' : 'camera', delegate: null, error: null,
+  elapsed: 0, frames: 0, trackedFrames: 0, samples: 0,
+  stats: null,
+  ranges: {
+    paddleArm: mkStat(-1, 1), swordArm: mkStat(-1, 1), px: mkStat(0, 1), py: mkStat(0, 1),
+    lean: mkStat(-0.35, 0.35), paddleSwing: mkStat(-20, 20), swordSpin: mkStat(-1200, 1200, 12),
+  },
+  flips: [],      // 视频时刻（s）
+  series: [],     // [t, paddleArm, swordArm, swordSpin]（每 0.1s）
+});
+const R = (window.__rec = []);
+const RAW = (window.__raw = []);
+const r3 = (v) => Math.round(v * 1000) / 1000;
+const vt = (now) => (camT0 === null ? 0 : ((now - camT0) / 1000) % LOOP); // 视频时刻
+
+// ---- 启动
+async function boot() {
+  if (MOCK) {
+    mock = new MockHand(cv);
+    tracker.setMock(mock);
+    camT0 = performance.now();
+    runMockSweep();
+  } else {
+    try {
+      await tracker.init({ wasmBase: '../vendor/mediapipe/wasm', modelPath: '../vendor/models/hand_landmarker.task' });
+      T.delegate = tracker.delegate;
+      if (REC) {
+        // 逐次记录原始检测（未镜像、未滤波、含全部手），供 tests/stubs/tracking_replay.mjs 离线回放
+        const lm = tracker.landmarker, det = lm.detectForVideo.bind(lm);
+        lm.detectForVideo = (v, ts) => {
+          const r = det(v, ts);
+          RAW.push([r3(vt(performance.now())), r.landmarks.map((h, i) => [r.handedness[i]?.[0]?.categoryName || '', +(r.handedness[i]?.[0]?.score || 0).toFixed(2), ...h.flatMap((p) => [r3(p.x), r3(p.y), r3(p.z)])])]);
+          return r;
+        };
+      }
+      await tracker.startCamera();
+      camT0 = performance.now();
+    } catch (e) {
+      err = String(e); T.error = err; console.error(e);
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+let last = performance.now(), lastLm = null, lastSeries = -1;
+function frame(now) {
+  const dt = Math.min(0.05, Math.max(0.001, (now - last) / 1000));
+  last = now;
+  tracker.update(now);
+  const hs = tracker.state;
+  control = mapper.update(hs, dt);
+
+  if (camT0 !== null) {
+    const t = vt(now);
+    T.frames++;
+    T.elapsed = r3((now - camT0) / 1000);
+    T.stats = { ...hs.stats, inferenceMs: r3(hs.stats.inferenceMs) };
+    if (hs.tracked) {
+      T.trackedFrames++;
+      for (const k of ['paddleArm', 'swordArm', 'px', 'py', 'lean', 'paddleSwing', 'swordSpin']) addStat(T.ranges[k], control[k]);
+    }
+    if (hs.landmarks && hs.landmarks !== lastLm) {
+      lastLm = hs.landmarks;
+      T.samples++;
+      if (REC) R.push([r3(t), hs.handedness === 'Left' ? 1 : 0, ...hs.landmarks.flatMap((p) => [r3(p.x), r3(p.y), r3(p.z)])]);
+    }
+    if (control.swordFlip) T.flips.push(r3(t));
+    const bucket = Math.floor(t * 10);
+    if (bucket !== lastSeries && T.elapsed < LOOP) {
+      lastSeries = bucket;
+      T.series.push([r3(t), +control.paddleArm.toFixed(2), +control.swordArm.toFixed(2), Math.round(control.swordSpin), hs.tracked ? 1 : 0]);
+    }
+  }
+  draw(now, hs);
+  requestAnimationFrame(frame);
+}
+
+// ---- 绘制
+const MINT = '#5CF2B8', RED = '#FF4D6D', MAG = '#FF4FD8';
+const BONES = [[0, 1], [0, 5], [0, 17], [5, 9], [9, 13], [13, 17], ...Object.values(FINGER_CHAINS).flatMap((ch) => ch.slice(1).map((v, i) => [ch[i], v]))];
+let flipFlash = 0;
+
+function draw(now, hs) {
+  const w = W(), h = H();
+  ctx.fillStyle = '#0e0e0e';
+  ctx.fillRect(0, 0, w, h);
+  const camH = Math.round(w * 0.75);
+  // 镜像视频
+  if (!MOCK && video.readyState >= 2) {
+    ctx.save();
+    ctx.translate(w, 0); ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0, w, camH);
+    ctx.restore();
+  } else {
+    ctx.fillStyle = '#1b1b1b'; ctx.fillRect(0, 0, w, camH);
+  }
+  // 关键点
+  if (hs.landmarks) {
+    const P = (p) => [p.x * w, p.y * camH];
+    ctx.globalAlpha = hs.tracked ? 1 : 0.35;
+    ctx.strokeStyle = MINT; ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (const [a, b] of BONES) { ctx.moveTo(...P(hs.landmarks[a])); ctx.lineTo(...P(hs.landmarks[b])); }
+    ctx.stroke();
+    for (const k of ['I', 'M', 'R', 'L']) {
+      const [x, y] = P(hs.landmarks[FINGER_CHAINS[k][3]]);
+      ctx.beginPath(); ctx.arc(x, y, 7, 0, Math.PI * 2); ctx.stroke();
+    }
+    const [tx, ty] = P(hs.landmarks[4]);
+    ctx.fillStyle = RED; ctx.beginPath(); ctx.arc(tx, ty, 8, 0, Math.PI * 2); ctx.fill();
+    const [px, py] = [hs.palm.x * w, hs.palm.y * camH];
+    ctx.strokeStyle = '#fff'; ctx.beginPath(); ctx.arc(px, py, 4, 0, Math.PI * 2); ctx.stroke();
+    ctx.font = '13px Consolas, monospace'; ctx.fillStyle = '#fff';
+    for (const k of ['T', 'L']) {
+      const tip = hs.fingers[k].tip;
+      ctx.fillText(`${k} ${(hs.fingers[k].angle * 57.3).toFixed(0)}°`, tip.x * w + 10, tip.y * camH - 10);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // 数值面板
+  ctx.font = '14px Consolas, monospace';
+  let y = camH + 22;
+  const c = control;
+  const st = hs.stats;
+  const line = (txt, col = '#ddd') => { ctx.fillStyle = col; ctx.fillText(txt, 12, y); y += 19; };
+  line(`hand ${hs.tracked ? '[ok] ' + hs.handedness : '[--]'}  src=${hs.source}  ${tracker.delegate || ''}  t=${vt(now).toFixed(1)}s`, hs.tracked ? MINT : '#888');
+  line(`render/track ${st.renderHz}/${st.trackHz} Hz  infer ${st.inferenceMs.toFixed(1)}ms  age ${st.sampleAgeMs.toFixed(0)}ms  motion ${hs.motion.toFixed(0)}px/s`);
+  if (err) line(`ERROR ${err}`, RED);
+  const bar = (name, v, lo, hi, col) => {
+    ctx.fillStyle = '#aaa'; ctx.fillText(name.padEnd(12) + (typeof v === 'number' ? v.toFixed(2) : v).padStart(8), 12, y);
+    const bx = 230, bw = w - bx - 16, z = Math.max(0, Math.min(1, (0 - lo) / (hi - lo)));
+    const t = Math.max(0, Math.min(1, (v - lo) / (hi - lo)));
+    ctx.strokeStyle = '#444'; ctx.strokeRect(bx, y - 11, bw, 12);
+    ctx.fillStyle = col; ctx.fillRect(bx + bw * Math.min(z, t), y - 11, bw * Math.abs(t - z), 12);
+    y += 19;
+  };
+  bar('px', c.px, 0, 1, MINT);
+  bar('py', c.py, 0, 1, MINT);
+  bar('lean', c.lean, -0.35, 0.35, MINT);
+  bar('paddleArm', c.paddleArm, -1, 1, RED);
+  bar('paddleSwing', c.paddleSwing, -15, 15, RED);
+  bar('swordArm', c.swordArm, -1, 1, MAG);
+  bar('swordSpin', c.swordSpin, -720, 720, MAG);
+  bar('motion', c.motion, 0, 1500, '#ccc');
+  if (c.swordFlip) flipFlash = 1;
+  flipFlash = Math.max(0, flipFlash - 0.02);
+  ctx.fillStyle = flipFlash > 0 ? `rgba(255,77,109,${flipFlash})` : '#555';
+  ctx.fillText(`swordFlip ×${T.flips.length}  ${T.flips.map((f) => f.toFixed(1)).join(' ')}`, 12, y); y += 19;
+  ctx.fillStyle = '#aaa';
+  ctx.fillText('fingers T I M R L', 12, y);
+  'TIMRL'.split('').forEach((k, i) => {
+    const bx = 230 + i * 60;
+    ctx.strokeStyle = '#444'; ctx.strokeRect(bx, y - 11, 50, 12);
+    ctx.fillStyle = MINT; ctx.fillRect(bx, y - 11, 50 * c.fingers[k], 12);
+  });
+  y += 26;
+
+  // 时间轴：paddleArm(红) swordArm(洋红) swordSpin(黄) + 调转标记
+  const gx = 12, gw = w - 24, gh = 120, gy = y;
+  ctx.strokeStyle = '#333'; ctx.strokeRect(gx, gy, gw, gh);
+  ctx.beginPath(); ctx.moveTo(gx, gy + gh / 2); ctx.lineTo(gx + gw, gy + gh / 2); ctx.stroke();
+  const X = (t) => gx + (t / LOOP) * gw;
+  const plot = (idx, scale, col) => {
+    ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.beginPath();
+    let pen = false;
+    for (const s of T.series) {
+      const yy = gy + gh / 2 - Math.max(-1, Math.min(1, s[idx] / scale)) * (gh / 2 - 2);
+      if (!s[4]) { pen = false; continue; }
+      pen ? ctx.lineTo(X(s[0]), yy) : ctx.moveTo(X(s[0]), yy); pen = true;
+    }
+    ctx.stroke();
+  };
+  plot(3, 900, '#E8C547'); plot(2, 1, MAG); plot(1, 1, RED);
+  ctx.strokeStyle = '#fff';
+  for (const f of T.flips) { ctx.beginPath(); ctx.moveTo(X(f), gy); ctx.lineTo(X(f), gy + gh); ctx.stroke(); }
+  ctx.fillStyle = '#777'; ctx.font = '11px Consolas, monospace';
+  for (let s = 0; s <= 45; s += 5) ctx.fillText(String(s), X(s) - 4, gy + gh + 12);
+  y = gy + gh + 30;
+
+  // 直方图
+  const hists = ['paddleArm', 'swordArm', 'px', 'py'];
+  const hw = (w - 24 - 30) / 4;
+  hists.forEach((k, i) => {
+    const s = T.ranges[k], hx = 12 + i * (hw + 10), hh = 70;
+    const m = Math.max(1, ...s.hist);
+    ctx.fillStyle = '#aaa'; ctx.font = '12px Consolas, monospace';
+    ctx.fillText(`${k} [${Number.isFinite(s.min) ? s.min.toFixed(2) : '-'}, ${Number.isFinite(s.max) ? s.max.toFixed(2) : '-'}]`, hx, y);
+    s.hist.forEach((n, j) => {
+      const bh = (n / m) * hh, bw = hw / s.hist.length;
+      ctx.fillStyle = i < 2 ? (i ? MAG : RED) : MINT;
+      ctx.fillRect(hx + j * bw + 1, y + 6 + hh - bh, bw - 2, bh);
+    });
+  });
+}
+
+// ---- 模拟手扫参数
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function runMockSweep() {
+  const M = (T.mock = { done: false });
+  await sleep(300);
+  const settle = async (o, ms = 350) => { mock.set(o); await sleep(ms); return control; };
+  const base = { palm: { x: 0.4, y: 0.6 }, scale: 0.16, thumb: -0.6, pinky: 0, roll: 0, curl: 0 };
+  await settle(base, 500);
+
+  // 1) 拇指 → paddleArm
+  M.thumb = [];
+  for (let v = -1; v <= 1.001; v += 0.25) M.thumb.push([+v.toFixed(2), +(await settle({ thumb: v })).paddleArm.toFixed(2)]);
+  await settle({ thumb: -0.6 });
+  // 挥拍：-1 → +1 的峰值角速度
+  await settle({ thumb: -1 }, 500);
+  let swingPeak = 0;
+  mock.set({ thumb: 1 });
+  for (let i = 0; i < 20; i++) { await sleep(16); swingPeak = Math.max(swingPeak, control.paddleSwing); }
+  M.swingPeak = +swingPeak.toFixed(2);
+  await settle({ thumb: -0.6 });
+
+  // 2) 小拇指 → swordArm
+  M.pinky = [];
+  for (let v = -1; v <= 1.001; v += 0.25) M.pinky.push([+v.toFixed(2), +(await settle({ pinky: v })).swordArm.toFixed(2)]);
+  await settle({ pinky: 0 });
+
+  // 3) 滚转 → lean
+  M.roll = [];
+  for (const v of [-0.8, -0.4, 0, 0.4, 0.8]) M.roll.push([v, +(await settle({ roll: v }, 600)).lean.toFixed(3)]);
+  await settle({ roll: 0 }, 600);
+
+  // 4) 掌心 → px/py
+  M.palm = [];
+  for (const [x, y] of [[0.2, 0.3], [0.5, 0.55], [0.8, 0.85]]) {
+    const c = await settle({ palm: { x, y } }, 400);
+    M.palm.push([x, y, +c.px.toFixed(2), +c.py.toFixed(2)]);
+  }
+  await settle({ palm: { x: 0.4, y: 0.6 } }, 400);
+
+  // 5) 握拳/张手 ×3 + 拇指快速挥拍 ×3：不应触发 swordFlip
+  const f0 = T.flips.length;
+  for (let i = 0; i < 3; i++) { await settle({ curl: 1 }, 400); await settle({ curl: 0 }, 400); }
+  for (let i = 0; i < 3; i++) { await settle({ thumb: 1 }, 200); await settle({ thumb: -1 }, 200); }
+  for (let i = 0; i < 3; i++) { await settle({ pinky: 1 }, 150); await settle({ pinky: -1 }, 150); }
+  await settle({ thumb: -0.6, pinky: 0 }, 300);
+  M.falseFlips = T.flips.length - f0;
+
+  // 6) E 甩剑：swordSpin 峰值、松开后衰减
+  let spinPeak = 0;
+  mock.set({ spin: true });
+  for (let i = 0; i < 60; i++) { await sleep(16); spinPeak = Math.max(spinPeak, Math.abs(control.swordSpin)); }
+  mock.set({ spin: false });
+  M.spinPeak = Math.round(spinPeak);
+  M.flipsDuringSpin = T.flips.length - f0;
+  await sleep(1500);
+  M.spinAfter1500ms = Math.round(control.swordSpin);
+  await sleep(1500);
+  M.spinAfter3000ms = Math.round(control.swordSpin);
+
+  // 7) B 调转：触发一次；冷却内再按不触发；冷却后再触发
+  const f1 = T.flips.length;
+  mock.set({ flip: true }); await sleep(800);
+  M.flipFirst = T.flips.length - f1;
+  mock.set({ flip: true }); await sleep(800);
+  M.flipInCooldown = T.flips.length - f1;
+  await sleep(1200);
+  mock.set({ flip: true }); await sleep(800);
+  M.flipAfterCooldown = T.flips.length - f1;
+
+  // 8) 丢手：250ms 内保持，之后 tracked=false / active=false；重新出现恢复
+  mock.set({ visible: false });
+  await sleep(150);
+  M.trackedAt150 = tracker.state.tracked;
+  await sleep(250);
+  M.trackedAt400 = tracker.state.tracked;
+  M.activeAt400 = control.active;
+  await sleep(1500);
+  M.lostPaddleArm = +control.paddleArm.toFixed(2);
+  mock.set({ visible: true });
+  await sleep(300);
+  M.reacquired = tracker.state.tracked && control.active;
+  M.handState = {
+    palmSize: +tracker.state.palmSize.toFixed(3),
+    fingers: Object.fromEntries(Object.entries(tracker.state.fingers).map(([k, f]) => [k, { ext: +f.ext.toFixed(2), angleDeg: Math.round(f.angle * 57.3) }])),
+    stats: tracker.state.stats,
+  };
+  M.done = true;
+}
+
+boot();
+</script>
+</body>
+</html>

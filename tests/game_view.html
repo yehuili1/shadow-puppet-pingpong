@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>玩法模块 D 调试视图</title>
+<style>html,body{margin:0;background:#141414;overflow:hidden}canvas{display:block}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script type="module">
+// 玩法调试视图：Director + 自动玩家；?battle=1 演示武斗；?fake=1 用替身 rig（否则优先真 PuppetRig）；?lapse=1 玩家必漏球
+import { Director } from '../src/game/director.js';
+import { events } from '../src/core/events.js';
+import { WORLD, TABLE, ZONES } from '../src/core/world.js';
+import { remap } from '../src/core/math.js';
+import { FakeRig } from './stubs/game_fake_rig.js';
+import { AutoPlayer, calibrate } from './stubs/game_autoplay.js';
+
+const q = new URLSearchParams(location.search);
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+cv.width = innerWidth; cv.height = innerHeight;
+
+let Rig = FakeRig, real = false;
+if (!q.has('fake')) {
+  try {
+    const art = await import('../src/puppet/art.js');
+    await art.loadPuppetArt?.();
+    Rig = (await import('../src/puppet/rig.js')).PuppetRig;
+    real = true;
+  } catch (e) { console.warn('real rig unavailable, using fake', e); }
+}
+const d = new Director();
+const pr = new Rig({ character: 'hero', facing: 1 }), cr = new Rig({ character: 'rival', facing: -1 });
+const ap = new AutoPlayer(calibrate(), { lapse: q.has('lapse') ? +q.get('lapse') : 0.12 });
+const log = [];
+events.on((e) => log.push(`${e.t.toFixed(1)}s ${e.text}`));
+const seen = new Set();
+let t = 0, last = performance.now();
+
+function control(dt) {
+  const c = ap.update(dt, d, pr);
+  if (!q.has('battle')) return c;
+  // 武斗演示：2s 后调转小拇指，冲到电脑跟前甩剑
+  c.swordFlip = t > 2 && t - dt <= 2;
+  if (d.mode === 'BATTLE') {
+    const body = cr.bodyHit[0];
+    c.px = remap(Math.min(body.x - 300, 1400), ZONES.battle.xMin, ZONES.battle.xMax, 0.15, 0.85);
+    c.swordArm = Math.sin(t * 5) * 0.5;
+    c.swordSpin = t > 4 ? 620 : 0;
+  } else c.swordSpin = 0;
+  return c;
+}
+
+function frame(now) {
+  const dt = Math.min(0.05, Math.max(0.001, (now - last) / 1000));
+  last = now;
+  t += dt;
+  d.update(dt, { control: control(dt), playerRig: pr, cpuRig: cr });
+  seen.add(d.status);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+function draw() {
+  const W = cv.width, s = W / WORLD.W, oy = 120;
+  ctx.fillStyle = '#141414';
+  ctx.fillRect(0, 0, W, cv.height);
+  ctx.save();
+  ctx.translate(0, oy);
+  ctx.scale(s, s);
+  ctx.fillStyle = '#d9b98a';
+  ctx.fillRect(0, 0, WORLD.W, WORLD.H);
+  ctx.fillStyle = '#7a5a3a';
+  ctx.fillRect(0, WORLD.floorY, WORLD.W, WORLD.H - WORLD.floorY);
+  // 桌与网
+  ctx.globalAlpha = d.tableAlpha;
+  ctx.fillStyle = '#4a3020';
+  ctx.fillRect(TABLE.x0, TABLE.topY, TABLE.x1 - TABLE.x0, TABLE.thickness);
+  ctx.fillRect(TABLE.x0 + 20, TABLE.topY, 12, WORLD.floorY - TABLE.topY);
+  ctx.fillRect(TABLE.x1 - 32, TABLE.topY, 12, WORLD.floorY - TABLE.topY);
+  ctx.fillRect(TABLE.netX - 3, TABLE.netTopY, 6, TABLE.topY - TABLE.netTopY);
+  ctx.globalAlpha = 1;
+  // 击球区
+  ctx.strokeStyle = 'rgba(0,120,255,.35)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(440, 520, 180, 200);
+  pr.draw(ctx, { strings: true });
+  cr.draw(ctx, { strings: true });
+  // 球 + 拖尾
+  const b = d.ball;
+  if (b.visible) {
+    ctx.strokeStyle = 'rgba(255,255,255,.8)';
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    b.trail.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+    ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+  ctx.restore();
+  // 文字
+  const st = d.stats;
+  ctx.fillStyle = '#5CF2B8';
+  ctx.font = '22px Consolas, monospace';
+  ctx.fillText(`AGENT: ${d.mode}   rig: ${real ? 'PuppetRig' : 'FakeRig'}`, 16, 36);
+  ctx.fillStyle = '#FF4FD8';
+  ctx.fillText(`STATUS: ${d.status}`, 16, 70);
+  ctx.fillStyle = '#ddd';
+  ctx.font = '20px Consolas, monospace';
+  const y0 = oy + WORLD.H * s + 40;
+  const lines = [
+    `score P${st.scorePlayer} : C${st.scoreCpu}   returns ${st.returns}   rally ${st.rallyTime.toFixed(1)}s   hits ${st.hits}`,
+    `paddle ${d.paddleState}   table ${d.tableAlpha.toFixed(2)}   hp ${d.battle.hp ?? '-'}`,
+    `cpu tongue ${cr.pose.tongue.toFixed(2)}  fallen ${cr.pose.fallen.toFixed(2)}  x ${cr.pose.x.toFixed(0)}`,
+    '', ...log.slice(-14),
+  ];
+  lines.forEach((l, i) => ctx.fillText(l, 16, y0 + i * 28));
+}
+
+window.__test = {
+  get state() {
+    return { mode: d.mode, status: d.status, stats: { ...d.stats }, ball: { x: Math.round(d.ball.x), y: Math.round(d.ball.y), visible: d.ball.visible }, tableAlpha: d.tableAlpha, paddleState: d.paddleState, seen: [...seen], real, events: log.slice(-8) };
+  },
+};
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

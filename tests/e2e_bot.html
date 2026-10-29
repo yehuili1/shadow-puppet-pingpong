@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>指尖皮影剧场 · 端到端自动玩家</title>
+  <link rel="icon" href="data:,">
+  <!-- 与 index.html 相同的页面骨架 + 自动玩家（模拟手走完整追踪→控制→导演→渲染链路）。需带 ?mock=1 -->
+  <style>
+    html, body { margin: 0; height: 100%; background: #0e0e0e; overflow: hidden; }
+    #app { display: block; width: 100vw; height: 100vh; }
+    #cam { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+    #notice { display: none !important; }
+  </style>
+  <script>
+    // 截图冻结：__freeze=true 时所有 rAF 回调顺延（画面停在条件满足的那一帧，截图与状态一致）
+    (() => {
+      const raf = window.requestAnimationFrame.bind(window);
+      window.__freeze = false;
+      window.requestAnimationFrame = (cb) => raf(function tick(t) { if (window.__freeze) raf(tick); else cb(t); });
+    })();
+  </script>
+</head>
+<body>
+  <canvas id="app"></canvas>
+  <video id="cam" playsinline muted></video>
+  <div id="notice"></div>
+  <script type="module" src="../src/main.js"></script>
+  <script type="module" src="./e2e_bot.js"></script>
+</body>
+</html>

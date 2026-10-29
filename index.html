@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>指尖皮影剧场</title>
+  <link rel="icon" href="data:,">
+  <style>
+    html, body { margin: 0; height: 100%; background: #0e0e0e; overflow: hidden; }
+    #app { display: block; width: 100vw; height: 100vh; }
+    #cam { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+    #notice {
+      position: absolute; left: 50%; bottom: 24px; transform: translateX(-50%);
+      padding: 8px 14px; border: 1px solid rgba(255,255,255,.25); background: rgba(10,10,10,.7);
+      color: #cfcfcf; font: 13px/1.5 ui-monospace, Consolas, monospace; border-radius: 4px;
+      display: none; white-space: normal; width: max-content; max-width: calc(100vw - 24px); box-sizing: border-box; text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="app"></canvas>
+  <video id="cam" playsinline muted></video>
+  <div id="notice"></div>
+  <script type="module" src="src/main.js" onerror="window.__bootFail && window.__bootFail()"></script>
+  <script>
+    // 兜底提示（非模块脚本）：直接双击 index.html（file://）或模块加载失败时，别让整页纯黑
+    (function () {
+      var n = document.getElementById('notice');
+      function say(t) { n.textContent = t; n.style.display = 'block'; }
+      if (location.protocol === 'file:') return say('请双击 start.bat 启动（直接打开 index.html 无法加载程序和摄像头）');
+      window.__bootFail = function () { say('页面加载失败：请用 start.bat 打开，或见 README 常见问题'); };
+      setTimeout(function () { if (!window.__app) window.__bootFail(); }, 8000);
+    })();
+  </script>
+</body>
+</html>

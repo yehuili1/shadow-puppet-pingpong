@@ -1,0 +1,18 @@
+<!DOCTYPE html><html><body style="margin:0;background:#000">
+<video id="v" playsinline muted style="width:640px;height:480px"></video>
+<script type="module">
+import { FilesetResolver, HandLandmarker } from '../vendor/mediapipe/vision_bundle.mjs';
+const v = document.getElementById('v');
+window.__probe = { frames: 0, hands: 0, err: null, delegate: null, ms: 0 };
+try {
+  v.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+  await v.play();
+  const fs = await FilesetResolver.forVisionTasks('../vendor/mediapipe/wasm');
+  let lm;
+  for (const delegate of ['GPU', 'CPU']) {
+    try { lm = await HandLandmarker.createFromOptions(fs, { baseOptions: { modelAssetPath: '../vendor/models/hand_landmarker.task', delegate }, runningMode: 'VIDEO', numHands: 2 }); window.__probe.delegate = delegate; break; } catch (e) { console.warn(delegate, 'failed', e); }
+  }
+  const loop = () => { const t0 = performance.now(); const r = lm.detectForVideo(v, t0); window.__probe.ms = performance.now() - t0; window.__probe.frames++; if (r.landmarks.length) { window.__probe.hands++; window.__probe.last = r.handedness.map(h => h[0].categoryName); } requestAnimationFrame(loop); };
+  loop();
+} catch (e) { window.__probe.err = String(e); }
+</script></body></html>

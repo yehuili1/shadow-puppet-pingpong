@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>rig test — 皮影骨骼</title>
+<link rel="icon" href="data:,">
+<style>html,body{margin:0;height:100%;background:#1a1a1a;overflow:hidden}canvas{display:block}</style>
+<script>
+  // 默认把 /src/puppet/art.js 映射到测试替身；?real 用真实 art.js
+  if (!/[?&]real(&|=|$)/.test(location.search)) {
+    const im = document.createElement('script');
+    im.type = 'importmap';
+    im.textContent = JSON.stringify({ imports: { '/src/puppet/art.js': '/tests/stubs/rig_art_stub.js' } });
+    document.currentScript.after(im);
+  }
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script type="module">
+// 用法：tests/rig.html               循环演示全部阶段
+//       tests/rig.html?phase=ik      只演示某阶段：sweep | ik | sway | tongue | sword | fallen
+//       &real=1 用真实 art.js        &debug=0 关调试叠加
+import { PuppetRig } from '/src/puppet/rig.js';
+import { loadPuppetArt } from '/src/puppet/art.js';
+import { WORLD, TABLE, PELVIS_Y } from '/src/core/world.js';
+import { SK } from '/src/puppet/skeleton.js';
+import { damp } from '/src/core/math.js';
+
+const q = new URLSearchParams(location.search);
+const ONLY = q.get('phase');
+const DEBUG = q.get('debug') !== '0';
+await loadPuppetArt();
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let nDraw = 0;
+const _drawImage = ctx.drawImage;
+ctx.drawImage = function (...a) { nDraw++; return _drawImage.apply(this, a); };
+
+let view = { k: 1, ox: 0, oy: 0, dpr: 1 };
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2), w = innerWidth, h = innerHeight;
+  cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  cv.style.width = w + 'px'; cv.style.height = h + 'px';
+  const k = Math.min(w / WORLD.W, h / WORLD.H);
+  view = { k, ox: (w - WORLD.W * k) / 2, oy: (h - WORLD.H * k) / 2, dpr };
+}
+addEventListener('resize', resize);
+resize();
+
+const hero = new PuppetRig({ character: 'hero', facing: 1 });
+const rival = new PuppetRig({ character: 'rival', facing: -1 });
+const rigs = [hero, rival];
+const HOME = [310, 1290];
+// HUD 式彩色小人：验证 scale / style / facing 镜像 / strings 参数
+const miniH = new PuppetRig({ character: 'hero', facing: 1, style: 'color', scale: 0.3 });
+const miniR = new PuppetRig({ character: 'rival', facing: -1, style: 'color', scale: 0.3 });
+
+const neutral = (i) => ({
+  x: HOME[i], y: PELVIS_Y, lean: 0, headTilt: 0, frontShoulder: -0.8, frontElbow: -0.6,
+  backShoulder: 0.2, backElbow: -1.4, swordAngle: -1.2, frontLeg: -0.1, backLeg: 0.12, tongue: 0, fallen: 0, visible: 1,
+});
+
+// ---------- 统计 ----------
+const acc = () => ({ n: 0, sum: 0, max: 0 });
+const add = (s, v) => { s.n++; s.sum += v; s.max = Math.max(s.max, v); };
+const fin = (s) => ({ n: s.n, mean: s.n ? +(s.sum / s.n).toFixed(4) : null, max: +s.max.toFixed(4) });
+const ikLive = { front: acc(), back: acc() };
+const sway = { torso: 0, head: 0, armU: 0, legF: 0, skirt: 0, walkAmp: 0, paddleDev: 0, residualLeg: 0, settledLeg: 0, stopTorso: 0 };
+const swordStat = { maxTipSpeed: 0 };
+const perf = acc();
+const draws = { hero: 0, rival: 0, mini: 0 };
+
+// ---------- 纯 IK 校验（snap，无弹簧） ----------
+function rng(seed) { return () => ((seed = (seed * 16807) % 2147483647) / 2147483647); }
+function ikSnapTest() {
+  const R = rng(7), inR = acc(), outAng = acc();
+  let elbowDownBad = 0, elbowDownN = 0, outElbowMax = 0;
+  for (const facing of [1, -1]) for (const scale of [1, 0.6]) for (const lean of [-0.3, 0, 0.25]) for (const arm of ['front', 'back']) {
+    const r = new PuppetRig({ character: 'hero', facing, scale });
+    r.setPose({ x: 700, y: 500, lean }).snap();
+    const front = arm === 'front';
+    const sh = front ? r.joints.fShoulder : r.joints.bShoulder;
+    const l1 = SK.upperArmLen, l2 = front ? SK.forearmLen + SK.paddleCenter : SK.forearmLen;
+    const lo = Math.abs(l1 - l2) + 2, hi = l1 + l2 - 2;
+    const end = () => (front ? r.paddle : r.joints.bWrist);
+    const set = (s) => r.setPose(front ? { frontShoulder: s.shoulder, frontElbow: s.elbow } : { backShoulder: s.shoulder, backElbow: s.elbow }).snap();
+    for (let i = 0; i < 80; i++) {
+      const d = (lo + R() * (hi - lo)) * scale, a = R() * Math.PI * 2;
+      const tx = sh.x + Math.cos(a) * d, ty = sh.y + Math.sin(a) * d;
+      set(r.ikArm(arm, tx, ty));
+      add(inR, Math.hypot(end().x - tx, end().y - ty));
+      // 向前（±60°）够时肘应在「肩→目标」连线下方
+      const fwd = Math.cos(a) * facing;
+      if (fwd > 0.5) {
+        const el = front ? r.joints.fElbow : r.joints.bElbow;
+        const cross = (tx - sh.x) * (el.y - sh.y) - (ty - sh.y) * (el.x - sh.x);
+        elbowDownN++;
+        if (cross * facing < -1e-6) elbowDownBad++;
+      }
+    }
+    for (let i = 0; i < 20; i++) { // 够不着：伸直指向目标
+      const d = (l1 + l2) * scale * (1.2 + R()), a = R() * Math.PI * 2;
+      const tx = sh.x + Math.cos(a) * d, ty = sh.y + Math.sin(a) * d;
+      const s = r.ikArm(arm, tx, ty);
+      set(s);
+      const ea = Math.atan2(end().y - sh.y, end().x - sh.x);
+      let da = Math.abs(ea - a) % (Math.PI * 2);
+      if (da > Math.PI) da = Math.PI * 2 - da;
+      add(outAng, da);
+      outElbowMax = Math.max(outElbowMax, Math.abs(s.elbow));
+    }
+  }
+  // dt 极小 / 0 时速度稳健
+  const r = new PuppetRig({ character: 'rival', facing: -1 });
+  r.setPose({ x: 1200, frontShoulder: -2 });
+  r.update(0); r.update(1e-7); r.update(0.016); r.update(1e-7);
+  const velOk = [r.paddle.vx, r.paddle.vy, r.swordTip.vx, r.swordTip.vy].every(Number.isFinite);
+  return { reachable: fin(inR), outOfReachAngleErrRad: fin(outAng), outOfReachElbowMax: +outElbowMax.toFixed(6), elbowDownBad, elbowDownN, tinyDtVelocityFinite: velOk };
+}
+const ikSnap = ikSnapTest();
+
+// ---------- 阶段编排 ----------
+const PHASES = [['sweep', 4], ['ik', 7.6], ['sway', 5.5], ['tongue', 3], ['sword', 3.5], ['fallen', 4.6]];
+const DUR = Object.fromEntries(PHASES);
+const CYCLE = PHASES.reduce((s, p) => s + p[1], 0);
+const HOLD = 0.6, STEPS = 12;
+const ikT = [{ f: null, b: null }, { f: null, b: null }];
+let ikStepDone = [-1, -1];
+const smoothX = [HOME[0], HOME[1]];
+const swordAcc = [-1.2, -1.2];
+
+const C = {
+  sweep(lt, i, r) {
+    r.setPose({
+      ...neutral(i),
+      lean: 0.18 * Math.sin(lt * 1.1 + i), headTilt: 0.15 * Math.sin(lt * 2.3),
+      frontShoulder: -1.55 + 1.55 * Math.sin(lt * 1.6), frontElbow: -0.9 + 0.8 * Math.cos(lt * 2.2),
+      backShoulder: -1.3 - 1.3 * Math.sin(lt * 1.3 + 1), backElbow: -1.1 + 0.7 * Math.sin(lt * 2),
+      frontLeg: 0.2 * Math.sin(lt * 1.5), backLeg: -0.2 * Math.sin(lt * 1.5),
+    });
+  },
+  ik(lt, i, r) {
+    const lean = i ? -0.12 : 0.15, f = r.facing;
+    r.setPose({ ...neutral(i), lean });
+    const k = Math.floor(lt / HOLD) % STEPS;
+    const a = (k * Math.PI * 2) / STEPS + i * 0.4;
+    // 肩的世界位置（按目标姿态）
+    const sh = (p) => ({ x: HOME[i] + f * (p.x * Math.cos(lean) - p.y * Math.sin(lean)), y: PELVIS_Y + p.x * Math.sin(lean) + p.y * Math.cos(lean) });
+    const fs = sh(SK.frontShoulder), bs = sh(SK.backShoulder);
+    const ft = { x: fs.x + f * 140 + 90 * Math.cos(a), y: fs.y + 20 + 90 * Math.sin(a) };
+    const bt = { x: bs.x + f * 90 + 70 * Math.cos(-a * 1.5), y: bs.y + 60 + 70 * Math.sin(-a * 1.5) };
+    ikT[i].f = ft; ikT[i].b = bt;
+    const s1 = r.ikArm('front', ft.x, ft.y), s2 = r.ikArm('back', bt.x, bt.y);
+    r.setPose({ frontShoulder: s1.shoulder, frontElbow: s1.elbow, backShoulder: s2.shoulder, backElbow: s2.elbow });
+    // 每步保持末尾测一次（跳过第 0 步：刚从上一阶段切过来）
+    const step = Math.floor(lt / HOLD);
+    ikT[i].measure = step >= 1 && lt - step * HOLD > HOLD - 0.05 && ikStepDone[i] !== step;
+    if (ikT[i].measure) ikStepDone[i] = step;
+  },
+  sway(lt, i, r, dt) {
+    const moving = lt < 2.75;
+    let tx = HOME[i];
+    if (moving) tx = i === 0 ? (Math.floor(lt / 0.55) % 2 ? 450 : 170) : HOME[i] + 150 * Math.sin(lt * 6);
+    smoothX[i] = damp(smoothX[i], tx, 12, dt); // 模拟 ControlMapper 的平滑
+    r.setPose({ ...neutral(i), x: smoothX[i], y: PELVIS_Y + (moving && i === 0 ? 18 * Math.sin(lt * 9) : 0) });
+  },
+  tongue(lt, i, r) {
+    if (i === 1) r.setPose({ ...neutral(i), tongue: 0.5 + 0.5 * Math.sin(lt * 22), lean: -0.15, headTilt: 0.12 * Math.sin(lt * 11), frontShoulder: -2.7, frontElbow: -0.3 });
+    else r.setPose({ ...neutral(i), tongue: lt < 2 ? 1 : 0, headTilt: -0.2 });
+  },
+  sword(lt, i, r, dt) {
+    swordAcc[i] += 6.3 * dt * (i ? -1 : 1); // 361°/s
+    r.setPose({ ...neutral(i), backShoulder: -2.1, backElbow: -0.5, swordAngle: swordAcc[i], lean: i ? 0 : 0.1 });
+  },
+  fallen(lt, i, r) {
+    // 往中间站，躺平后整个身体（约 700 长）留在画面内；先后倒地
+    const down = i === 1 ? lt > 2.3 && lt < 4.2 : lt > 0.5 && lt < 2.2;
+    r.setPose({ ...neutral(i), x: i ? 620 : 980, fallen: down ? 1 : 0, visible: i === 0 && lt > 3.9 ? 0.3 : 1, frontShoulder: down ? -2.4 : -0.8 });
+  },
+};
+
+// 按平滑后姿态、去掉一切摆动算出的拍心（世界）
+function rigidPaddle(r) {
+  const P = r.pose, c = Math.cos(P.lean), s = Math.sin(P.lean), sh = SK.frontShoulder;
+  const a1 = P.lean + P.frontShoulder, a2 = a1 + P.frontElbow, l2 = SK.forearmLen + SK.paddleCenter;
+  const x = sh.x * c - sh.y * s - Math.sin(a1) * SK.upperArmLen - Math.sin(a2) * l2;
+  const y = sh.x * s + sh.y * c + Math.cos(a1) * SK.upperArmLen + Math.cos(a2) * l2;
+  return { x: P.x + r.facing * x * r.scale, y: P.y + y * r.scale };
+}
+
+function measure(ph, lt) {
+  rigs.forEach((r, i) => {
+    if (ph === 'ik' && ikT[i].measure) {
+      add(ikLive.front, Math.hypot(r.paddle.x - ikT[i].f.x, r.paddle.y - ikT[i].f.y));
+      add(ikLive.back, Math.hypot(r.joints.bWrist.x - ikT[i].b.x, r.joints.bWrist.y - ikT[i].b.y));
+    }
+    if (ph === 'sway') {
+      const W = r._sw;
+      sway.torso = Math.max(sway.torso, Math.abs(W.torso.v));
+      sway.head = Math.max(sway.head, Math.abs(W.head.v));
+      sway.armU = Math.max(sway.armU, Math.abs(W.armU.v));
+      sway.legF = Math.max(sway.legF, Math.abs(W.legF.v));
+      sway.skirt = Math.max(sway.skirt, Math.abs(W.skirt.v));
+      sway.walkAmp = Math.max(sway.walkAmp, r._walkAmp);
+      // 次级运动对拍位置的影响：实际拍心 vs 无摆动的刚性 FK
+      const rp = rigidPaddle(r);
+      sway.paddleDev = Math.max(sway.paddleDev, Math.hypot(r.paddle.x - rp.x, r.paddle.y - rp.y));
+      if (lt > 2.85 && lt < 3.6) sway.residualLeg = Math.max(sway.residualLeg, Math.abs(W.legF.v));
+      if (lt > 2.85 && lt < 3.6) sway.stopTorso = Math.max(sway.stopTorso, Math.abs(W.torso.v));
+      if (lt > 5.2) sway.settledLeg = Math.max(sway.settledLeg, Math.abs(W.legF.v));
+    }
+    if (ph === 'sword') swordStat.maxTipSpeed = Math.max(swordStat.maxTipSpeed, Math.hypot(r.swordTip.vx, r.swordTip.vy));
+  });
+}
+
+// ---------- 绘制 ----------
+function drawStage() {
+  ctx.fillStyle = '#d8c296';
+  ctx.fillRect(0, 0, WORLD.W, WORLD.H);
+  ctx.strokeStyle = 'rgba(0,0,0,0.08)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 0; x <= WORLD.W; x += 100) { ctx.moveTo(x, 0); ctx.lineTo(x, WORLD.H); }
+  for (let y = 0; y <= WORLD.H; y += 100) { ctx.moveTo(0, y); ctx.lineTo(WORLD.W, y); }
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(60,40,20,0.5)';
+  ctx.fillRect(TABLE.x0, TABLE.topY, TABLE.x1 - TABLE.x0, TABLE.thickness);
+  ctx.fillRect(TABLE.netX - 2, TABLE.netTopY, 4, TABLE.topY - TABLE.netTopY);
+  ctx.strokeStyle = 'rgba(60,40,20,0.6)';
+  ctx.beginPath(); ctx.moveTo(0, WORLD.floorY); ctx.lineTo(WORLD.W, WORLD.floorY); ctx.stroke();
+  ctx.setLineDash([6, 6]);
+  ctx.beginPath(); ctx.moveTo(0, PELVIS_Y); ctx.lineTo(WORLD.W, PELVIS_Y); ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+const dot = (p, r, fill, stroke) => {
+  ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.stroke(); }
+};
+function drawDebug(r, i, ph) {
+  ctx.lineWidth = 1.5;
+  for (const b of r.bodyHit) dot(b, b.r, null, 'rgba(255,220,0,0.9)');
+  ctx.strokeStyle = '#ff00d0'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(r.swordBase.x, r.swordBase.y); ctx.lineTo(r.swordTip.x, r.swordTip.y); ctx.stroke();
+  ctx.lineWidth = 2;
+  dot(r.paddle, r.paddle.r, null, '#00e5ff');
+  ctx.strokeStyle = '#00e5ff';
+  ctx.beginPath(); ctx.moveTo(r.paddle.x, r.paddle.y); ctx.lineTo(r.paddle.x + r.paddle.vx * 0.05, r.paddle.y + r.paddle.vy * 0.05); ctx.stroke();
+  ctx.lineWidth = 1;
+  for (const k in r.joints) dot(r.joints[k], 4, '#fff', '#000');
+  for (const k in r.controlPoints) dot(r.controlPoints[k], 6, '#ff3030');
+  if (ph === 'ik' && ikT[i].f) {
+    for (const [t, c] of [[ikT[i].f, '#00ff60'], [ikT[i].b, '#ffa000']]) {
+      ctx.strokeStyle = c; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(t.x - 12, t.y); ctx.lineTo(t.x + 12, t.y); ctx.moveTo(t.x, t.y - 12); ctx.lineTo(t.x, t.y + 12); ctx.stroke();
+    }
+  }
+}
+
+function drawText(lines) {
+  ctx.font = '20px monospace';
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(560, 10, 480, lines.length * 24 + 14);
+  ctx.fillStyle = '#7CFFB2';
+  lines.forEach((s, k) => ctx.fillText(s, 572, 36 + k * 24));
+}
+
+// ---------- 主循环 ----------
+let last = performance.now(), T = 0, prevPh = null, frames = 0;
+function frame(now) {
+  const dt = Math.min(0.05, Math.max(0.001, (now - last) / 1000));
+  last = now; T += dt; frames++;
+  let ph, lt;
+  if (ONLY) { ph = ONLY; lt = T % DUR[ONLY]; }
+  else {
+    let u = T % CYCLE;
+    for (const [n, d] of PHASES) { if (u < d) { ph = n; lt = u; break; } u -= d; }
+  }
+  if (ph !== prevPh || (ONLY && lt < dt)) { ikStepDone = [-1, -1]; smoothX[0] = hero.target.x; smoothX[1] = rival.target.x; }
+  prevPh = ph;
+  rigs.forEach((r, i) => C[ph](lt, i, r, dt));
+  miniH.setPose({ ...hero.target, x: 130 + (hero.target.x - HOME[0]) * 0.3, y: 140 });
+  miniR.setPose({ ...rival.target, x: 1470 + (rival.target.x - HOME[1]) * 0.3, y: 140 });
+
+  const t0 = performance.now();
+  hero.update(dt); rival.update(dt);
+  miniH.update(dt); miniR.update(dt);
+  measure(ph, lt);
+
+  const { k, ox, oy, dpr } = view;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#1a1a1a'; ctx.fillRect(0, 0, innerWidth, innerHeight);
+  ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * ox, dpr * oy);
+  drawStage();
+  const t1 = performance.now();
+  nDraw = 0; hero.draw(ctx); draws.hero = nDraw;
+  nDraw = 0; rival.draw(ctx); draws.rival = nDraw;
+  add(perf, performance.now() - t1 + (t1 - t0));
+  nDraw = 0; miniH.draw(ctx, { stringTopY: 0 }); miniR.draw(ctx, { strings: false }); draws.mini = nDraw;
+  if (DEBUG) {
+    rigs.forEach((r, i) => drawDebug(r, i, ph));
+    drawText([
+      `phase ${ph}  t=${lt.toFixed(2)}`,
+      `IK live front mean/max ${fin(ikLive.front).mean ?? '-'} / ${fin(ikLive.front).max}`,
+      `IK live back  mean/max ${fin(ikLive.back).mean ?? '-'} / ${fin(ikLive.back).max}`,
+      `IK snap max ${ikSnap.reachable.max}  elbowBad ${ikSnap.elbowDownBad}`,
+      `drawImage hero ${draws.hero} rival ${draws.rival}`,
+      `paddle v ${Math.round(hero.paddle.vx)},${Math.round(hero.paddle.vy)}`,
+    ]);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+window.__test = {
+  get phase() { return prevPh; },
+  get frames() { return frames; },
+  ikSnap,
+  get ikLive() { return { front: fin(ikLive.front), back: fin(ikLive.back) }; },
+  get sway() { return Object.fromEntries(Object.entries(sway).map(([k, v]) => [k, +v.toFixed(4)])); },
+  get sword() { return { maxTipSpeed: Math.round(swordStat.maxTipSpeed) }; },
+  get draws() { return draws; },
+  get perfMs() { return fin(perf); },
+  get hero() { return { paddle: hero.paddle, swordTip: hero.swordTip, swordBase: hero.swordBase, bodyHit: hero.bodyHit, controlPoints: hero.controlPoints, pose: { x: hero.pose.x, fallen: hero.pose.fallen, tongue: hero.pose.tongue } }; },
+  get rival() { return { paddle: rival.paddle, bodyHit: rival.bodyHit, controlPoints: rival.controlPoints, pose: { x: rival.pose.x, fallen: rival.pose.fallen, tongue: rival.pose.tongue } }; },
+};
+</script>
+</body>
+</html>

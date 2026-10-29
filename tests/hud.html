@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>HUD 测试</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0e0e0e; overflow: hidden; }
+  #app { display: block; width: 100vw; height: 100vh; }
+  #cam { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+</style>
+<!--
+  参数：
+    hand=synth（默认，合成手）| real（src/tracking/hand.js 真实追踪）| mock（src/tracking/mock.js 模拟手 → 网格占位）
+    status=CELEBRATING 固定状态；lost=12 每 12 秒丢手 2 秒；novideo=1 不开摄像头
+    aspect=169 用 16:9 加黑边的画面喂 video（检验 cover 裁切后骨架是否对齐）
+    rig=stub / art=stub 强制用替身（rig.js / art.js 不存在时自动用替身）
+-->
+<script>
+  // rig.js 还没写好时，用 import map 把 /src/puppet/rig.js 重定向到替身
+  (function () {
+    const q = new URLSearchParams(location.search);
+    const exists = (u) => { try { const x = new XMLHttpRequest(); x.open('GET', u, false); x.send(); return x.status === 200; } catch (e) { return false; } };
+    const imports = {};
+    const rigStub = q.get('rig') === 'stub' || !exists('/src/puppet/rig.js');
+    const artStub = q.get('art') === 'stub' || !exists('/src/puppet/art.js');
+    if (rigStub) imports['/src/puppet/rig.js'] = '/tests/stubs/hud_rig.js';
+    if (artStub) imports['/src/puppet/art.js'] = '/tests/stubs/hud_art.js';
+    window.__rigKind = (rigStub ? 'stub' : 'real') + ' rig / ' + (artStub ? 'stub' : 'real') + ' art';
+    const s = document.createElement('script');
+    s.type = 'importmap';
+    s.textContent = JSON.stringify({ imports });
+    document.currentScript.after(s);
+  })();
+</script>
+</head>
+<body>
+<canvas id="app"></canvas>
+<video id="cam" playsinline muted></video>
+<script type="module">
+import { computeLayout } from '/src/render/layout.js';
+import { HudRenderer } from '/src/render/hud.js';
+import { events, clock } from '/src/core/events.js';
+import { WORLD, TABLE, ZONES, PELVIS_Y } from '/src/core/world.js';
+import { SynthHand, FakeControl, FakeDirector } from '/tests/stubs/hud_fakes.js';
+
+const q = new URLSearchParams(location.search);
+const canvas = document.getElementById('app');
+const ctx = canvas.getContext('2d');
+const video = document.getElementById('cam');
+const T = (window.__test = { frames: 0, rig: window.__rigKind, handMode: q.get('hand') || 'synth', notes: [] });
+
+const hud = new HudRenderer();
+const director = new FakeDirector(events, { fixed: q.get('status') });
+let layout, dpr;
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.round(innerWidth * dpr);
+  canvas.height = Math.round(innerHeight * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  layout = computeLayout(innerWidth, innerHeight);
+  hud.resize(layout, dpr);
+  T.layout = layout;
+  T.g = { fs: +hud.g.fs.toFixed(3), agent: rnd(hud.g.agent), term: rnd(hud.g.term) };
+}
+const rnd = (r) => ({ x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.w), h: Math.round(r.h) });
+addEventListener('resize', resize);
+resize();
+
+// 加载美术（真 art.js 读 manifest；替身为空操作）
+try { const art = await import('/src/puppet/art.js'); await art.loadPuppetArt(); } catch (e) { T.notes.push('art: ' + e.message); }
+
+// 视频源：假摄像头；aspect=169 时把画面加黑边做成 16:9 再喂给 video
+async function startVideo() {
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+  if (q.get('aspect') === '169') {
+    const src = document.createElement('video');
+    src.muted = true; src.srcObject = stream; await src.play();
+    const c = document.createElement('canvas'); c.width = 854; c.height = 480;
+    const cx = c.getContext('2d');
+    (function pump() { cx.fillStyle = '#000'; cx.fillRect(0, 0, 854, 480); cx.drawImage(src, 107, 0, 640, 480); requestAnimationFrame(pump); })();
+    video.srcObject = c.captureStream(30);
+  } else {
+    video.srcObject = stream;
+  }
+  await video.play();
+}
+
+let tracker = null, mapper = null, synth = null, fakeCtl = null;
+const handMode = T.handMode;
+try {
+  if (!q.has('novideo') && handMode !== 'mock') await startVideo();
+  if (handMode === 'real' || handMode === 'mock') {
+    const { HandTracker } = await import('/src/tracking/hand.js');
+    const { ControlMapper } = await import('/src/tracking/control.js');
+    tracker = new HandTracker({ video });
+    mapper = new ControlMapper();
+    if (handMode === 'mock') {
+      const { MockHand } = await import('/src/tracking/mock.js');
+      tracker.setMock(new MockHand(canvas));
+    } else {
+      await tracker.init({ wasmBase: '/vendor/mediapipe/wasm', modelPath: '/vendor/models/hand_landmarker.task' });
+      tracker.cameraOn = true;                       // 视频源由测试页自己接管
+      tracker.aspect = video.videoWidth / video.videoHeight;
+    }
+  }
+} catch (e) {
+  T.notes.push(`${handMode} 不可用，回退合成手：${e.message}`);
+  tracker = null;
+}
+if (!tracker) { synth = new SynthHand(); fakeCtl = new FakeControl(); }
+events.push('hud test ready');
+
+// 戏台占位：羊皮纸色 + 世界框 + 桌子 + 皮影活动范围（看横屏遮挡用）
+function drawStagePlaceholder() {
+  const s = layout.stage;
+  ctx.fillStyle = '#C9A877';
+  ctx.fillRect(s.x, s.y, s.w, s.h);
+  const k = Math.min(s.w / WORLD.W, s.h / WORLD.H);
+  const ox = s.x + (s.w - WORLD.W * k) / 2, oy = s.y + (s.h - WORLD.H * k) / 2;
+  ctx.save();
+  ctx.translate(ox, oy); ctx.scale(k, k);
+  ctx.strokeStyle = 'rgba(60,40,20,0.4)'; ctx.lineWidth = 2 / k; ctx.strokeRect(0, 0, WORLD.W, WORLD.H);
+  ctx.fillStyle = 'rgba(50,30,15,0.85)';
+  ctx.fillRect(TABLE.x0, TABLE.topY, TABLE.x1 - TABLE.x0, TABLE.thickness);
+  ctx.fillRect(TABLE.netX - 2, TABLE.netTopY, 4, TABLE.topY - TABLE.netTopY);
+  ctx.fillStyle = 'rgba(50,30,15,0.25)';
+  for (const z of [ZONES.player, ZONES.cpu]) ctx.fillRect(z.xMin - 90, PELVIS_Y - 360, z.xMax - z.xMin + 180, WORLD.floorY - PELVIS_Y + 360);
+  ctx.restore();
+}
+
+let last = performance.now(), fpsAcc = 0, fpsN = 0;
+function frame(now) {
+  const dt = Math.min(0.05, Math.max(0.001, (now - last) / 1000));
+  last = now;
+  const t = clock();
+  let hand, control;
+  if (tracker) {
+    tracker.update(now);
+    hand = tracker.state;
+    control = mapper.update(hand, dt);
+  } else {
+    hand = synth.update(t, dt, { lostEvery: Number(q.get('lost') || 0) });
+    const battle = director.status.startsWith('BATTLE');
+    control = fakeCtl.update(synth, dt, battle ? 360 * Math.sign(Math.sin(t * 0.7)) : 0);
+  }
+  director.update(dt);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawStagePlaceholder();
+  const h0 = performance.now();
+  hud.draw(ctx, { t, dt, video, hand, control, director, events, layout });
+  T.hudMs = +((T.hudMs || 0) * 0.95 + (performance.now() - h0) * 0.05).toFixed(3);
+
+  fpsAcc += dt; fpsN++;
+  T.frames++;
+  T.fps = Math.round(fpsN / fpsAcc);
+  T.status = director.status;
+  T.hand = { tracked: hand.tracked, source: hand.source, lm0: hand.landmarks && { x: +hand.landmarks[0].x.toFixed(3), y: +hand.landmarks[0].y.toFixed(3) } };
+  T.puppet = { k: +hud.puppet.k.toFixed(3), alpha: +hud.puppet.alpha.toFixed(2) };
+  T.video = { w: video.videoWidth, h: video.videoHeight, ready: video.readyState };
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
